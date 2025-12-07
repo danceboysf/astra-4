@@ -134,9 +134,13 @@ static void on_ts(void *arg, const uint8_t *ts)
     }
     response->buffer_count += TS_PACKET_SIZE;
 
-    const size_t start_fill = response->is_burst_done
-                            ? response->buffer_fill
-                            : response->burst_fill;
+    size_t start_fill = response->is_burst_done
+                       ? response->buffer_fill
+                       : response->burst_fill;
+
+    if(response->is_burst_done == false && response->buffer_count < start_fill)
+        start_fill = response->buffer_count > 0 ? response->buffer_count
+                                                : TS_PACKET_SIZE;
 
     if(   response->is_socket_busy == false
        && response->buffer_count >= start_fill)
