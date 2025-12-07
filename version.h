@@ -3,6 +3,8 @@
 
 #define ASTRA_VERSION_MAJOR 4
 #define ASTRA_VERSION_MINOR 4
-#define ASTRA_VERSION_PATCH 187
+#define ASTRA_VERSION_PATCH 188
+
+#define ASTRA_VERSION_SUFFIX "burst"
 
 #endif /* _VERSION_H_ */
