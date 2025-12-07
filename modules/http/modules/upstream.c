@@ -203,9 +203,17 @@ static void on_upstream_send(void *arg)
         }
         lua_pop(lua, 1);
 
+        const size_t min_size = TS_PACKET_SIZE + 1;
+
         if(client->response->buffer_size <= client->response->buffer_fill)
         {
             http_client_error(client, "buffer_size must be greater than buffer_fill");
+            http_client_abort(client, 500, "server configuration error");
+            return;
+        }
+        if(client->response->buffer_size < client->response->buffer_fill + min_size)
+        {
+            http_client_error(client, "buffer_size must exceed buffer_fill by at least one TS packet (%u bytes)", TS_PACKET_SIZE);
             http_client_abort(client, 500, "server configuration error");
             return;
         }
@@ -213,6 +221,12 @@ static void on_upstream_send(void *arg)
         if(client->response->buffer_size <= client->response->burst_fill)
         {
             http_client_error(client, "buffer_size must be greater than burst_size");
+            http_client_abort(client, 500, "server configuration error");
+            return;
+        }
+        if(client->response->buffer_size < client->response->burst_fill + min_size)
+        {
+            http_client_error(client, "buffer_size must exceed burst_size by at least one TS packet (%u bytes)", TS_PACKET_SIZE);
             http_client_abort(client, 500, "server configuration error");
             return;
         }
