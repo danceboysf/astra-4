@@ -368,7 +368,8 @@ options_usage = [[
     -l ADDR             source interface for UDP/RTP streams
     --buffer-size       buffer size in Kb (default: 1024)
     --buffer-fill       minimal packet size in Kb (default: 128)
-    --burst-size        initial burst size in Kb (disabled by default)
+    --burst-size        initial burst size in Kb sent immediately on connect
+                        to pre-fill client buffers (disabled by default)
     --no-udp            disable direct access the to UDP/RTP source
     --no-http           disable direct access the to HTTP source
     --pass              basic authentication for statistics. login:password

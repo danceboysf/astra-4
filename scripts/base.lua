@@ -768,7 +768,8 @@ Available Applications:
                         the digital television streaming
     --relay             Astra Relay  is an application for
                         the digital television relaying
-                        via the HTTP protocol
+                        via the HTTP protocol, supporting burst-on-connect
+                        prefill using --burst-size
     --analyze           Astra Analyze is a MPEG-TS stream analyzer
     --dvbls             DVB Adapters information list
     SCRIPT              launch Astra script
