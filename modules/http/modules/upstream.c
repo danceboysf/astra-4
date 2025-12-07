@@ -46,6 +46,9 @@ struct http_response_t
     size_t burst_fill;
     bool is_burst_done;
 
+    size_t burst_target;
+    size_t burst_sent;
+
     bool is_socket_busy;
 };
 
@@ -78,6 +81,13 @@ static void on_upstream_ready(void *arg)
             response->buffer_read += send_size;
             if(response->buffer_read >= response->buffer_size)
                 response->buffer_read = 0;
+
+            if(!response->is_burst_done)
+            {
+                response->burst_sent += send_size;
+                if(response->burst_sent >= response->burst_target)
+                    response->is_burst_done = true;
+            }
         }
         else if(send_size == -1)
         {
@@ -106,6 +116,7 @@ static void on_ts(void *arg, const uint8_t *ts)
         response->buffer_count = 0;
         response->buffer_read = 0;
         response->buffer_write = 0;
+        response->burst_sent = 0;
         if(response->is_socket_busy)
         {
             asc_socket_set_on_ready(client->sock, NULL);
@@ -136,16 +147,11 @@ static void on_ts(void *arg, const uint8_t *ts)
 
     size_t start_fill = response->is_burst_done
                        ? response->buffer_fill
-                       : response->burst_fill;
-
-    if(response->is_burst_done == false && response->buffer_count < start_fill)
-        start_fill = response->buffer_count > 0 ? response->buffer_count
-                                                : TS_PACKET_SIZE;
+                       : TS_PACKET_SIZE;
 
     if(   response->is_socket_busy == false
        && response->buffer_count >= start_fill)
     {
-        response->is_burst_done = true;
         asc_socket_set_on_ready(client->sock, on_upstream_ready);
         response->is_socket_busy = true;
     }
@@ -169,6 +175,8 @@ static void on_upstream_send(void *arg)
     client->response->buffer_size = DEFAULT_BUFFER_SIZE;
     client->response->buffer_fill = DEFAULT_BUFFER_FILL;
     client->response->burst_fill = DEFAULT_BUFFER_FILL;
+    client->response->burst_target = DEFAULT_BUFFER_FILL;
+    client->response->burst_sent = 0;
     client->response->is_burst_done = true;
 
     if(lua_istable(lua, 3))
@@ -203,7 +211,10 @@ static void on_upstream_send(void *arg)
             if(client->response->burst_fill == 0)
                 client->response->burst_fill = DEFAULT_BUFFER_FILL;
             else
+            {
                 client->response->is_burst_done = false;
+                client->response->burst_target = client->response->burst_fill;
+            }
         }
         lua_pop(lua, 1);
 
