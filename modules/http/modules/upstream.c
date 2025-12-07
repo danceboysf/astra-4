@@ -27,6 +27,13 @@
 struct module_data_t
 {
     int idx_callback;
+
+    MODULE_STREAM_DATA();
+
+    uint8_t *shared_buffer;
+    size_t shared_size;
+    size_t shared_count;
+    size_t shared_write;
 };
 
 struct http_response_t
@@ -51,6 +58,32 @@ struct http_response_t
 
     bool is_socket_busy;
 };
+
+static size_t shared_buffer_copy(module_data_t *mod, uint8_t *dst, size_t dst_size)
+{
+    if(mod->shared_count == 0 || dst_size == 0)
+        return 0;
+
+    const size_t copy_len = (mod->shared_count < dst_size)
+                            ? mod->shared_count
+                            : dst_size;
+
+    const size_t shared_read = (mod->shared_write + mod->shared_size - mod->shared_count)
+                               % mod->shared_size;
+
+    if(shared_read + copy_len <= mod->shared_size)
+    {
+        memcpy(dst, &mod->shared_buffer[shared_read], copy_len);
+    }
+    else
+    {
+        const size_t head = mod->shared_size - shared_read;
+        memcpy(dst, &mod->shared_buffer[shared_read], head);
+        memcpy(&dst[head], mod->shared_buffer, copy_len - head);
+    }
+
+    return copy_len;
+}
 
 /*
  * client->mod - http_server module
@@ -103,6 +136,36 @@ static void on_upstream_ready(void *arg)
         asc_socket_set_on_ready(client->sock, NULL);
         response->is_socket_busy = false;
     }
+}
+
+static void on_shared_ts(module_data_t *mod, const uint8_t *ts)
+{
+    if(mod->shared_size == 0)
+        return;
+
+    if(mod->shared_count + TS_PACKET_SIZE > mod->shared_size)
+    {
+        // overwrite the oldest packet to keep the newest burstable data
+        mod->shared_count -= TS_PACKET_SIZE;
+    }
+
+    const size_t write_pos = mod->shared_write;
+    if(write_pos + TS_PACKET_SIZE <= mod->shared_size)
+    {
+        memcpy(&mod->shared_buffer[write_pos], ts, TS_PACKET_SIZE);
+        mod->shared_write = (write_pos + TS_PACKET_SIZE) % mod->shared_size;
+    }
+    else
+    {
+        const size_t head = mod->shared_size - write_pos;
+        memcpy(&mod->shared_buffer[write_pos], ts, head);
+        memcpy(mod->shared_buffer, &ts[head], TS_PACKET_SIZE - head);
+        mod->shared_write = TS_PACKET_SIZE - head;
+    }
+
+    mod->shared_count += TS_PACKET_SIZE;
+    if(mod->shared_count > mod->shared_size)
+        mod->shared_count = mod->shared_size;
 }
 
 static void on_ts(void *arg, const uint8_t *ts)
@@ -171,6 +234,7 @@ static void on_upstream_send(void *arg)
     http_client_t *client = (http_client_t *)arg;
 
     module_stream_t *upstream = NULL;
+    module_data_t *mod = client->response->mod;
 
     client->response->buffer_size = DEFAULT_BUFFER_SIZE;
     client->response->buffer_fill = DEFAULT_BUFFER_FILL;
@@ -257,7 +321,41 @@ static void on_upstream_send(void *arg)
         return;
     }
 
+    if(mod->__stream.parent == NULL)
+    {
+        mod->__stream.on_ts = (void (*)(module_data_t *, const uint8_t *))on_shared_ts;
+        mod->__stream.self = mod;
+        __module_stream_init(&mod->__stream);
+        __module_stream_attach(upstream, &mod->__stream);
+    }
+
+    const size_t desired_shared = (client->response->burst_fill > client->response->buffer_size)
+                                  ? client->response->burst_fill
+                                  : client->response->buffer_size;
+
+    if(mod->shared_size < desired_shared)
+    {
+        mod->shared_buffer = (uint8_t *)realloc(mod->shared_buffer, desired_shared);
+        mod->shared_size = desired_shared;
+        mod->shared_count = 0;
+        mod->shared_write = 0;
+    }
+
     client->response->buffer = (uint8_t *)malloc(client->response->buffer_size);
+
+    if(mod->shared_buffer && mod->shared_count > 0)
+    {
+        const size_t preload = shared_buffer_copy(  mod
+                                                 , client->response->buffer
+                                                 , (client->response->burst_target < client->response->buffer_size)
+                                                    ? client->response->burst_target
+                                                    : (client->response->buffer_size - TS_PACKET_SIZE));
+        client->response->buffer_count = preload;
+        client->response->buffer_write = preload % client->response->buffer_size;
+        client->response->buffer_read = 0;
+        if(preload > 0)
+            client->response->is_burst_done = false;
+    }
 
     // like module_stream_init()
     client->response->__stream.self = (void *)client;
@@ -329,6 +427,12 @@ static void module_init(module_data_t *mod)
     asc_assert(lua_isfunction(lua, -1), "[http_upstream] option 'callback' is required");
     mod->idx_callback = luaL_ref(lua, LUA_REGISTRYINDEX);
 
+    mod->__stream.self = NULL;
+    mod->shared_buffer = NULL;
+    mod->shared_size = 0;
+    mod->shared_count = 0;
+    mod->shared_write = 0;
+
     // Deprecated
     bool is_deprecated = false;
 
@@ -361,6 +465,18 @@ static void module_destroy(module_data_t *mod)
         luaL_unref(lua, LUA_REGISTRYINDEX, mod->idx_callback);
         mod->idx_callback = 0;
     }
+
+    if(mod->__stream.self)
+    {
+        __module_stream_destroy(&mod->__stream);
+        mod->__stream.self = NULL;
+    }
+
+    free(mod->shared_buffer);
+    mod->shared_buffer = NULL;
+    mod->shared_size = 0;
+    mod->shared_count = 0;
+    mod->shared_write = 0;
 }
 
 MODULE_LUA_METHODS()
