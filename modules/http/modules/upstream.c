@@ -45,6 +45,7 @@ static inline size_t ts_align_or_default(size_t value, size_t fallback)
 typedef struct shared_buffer_t
 {
     module_stream_t __stream;
+    module_data_t *mod;
     module_stream_t *upstream;
 
     uint8_t *buffer;
@@ -184,8 +185,10 @@ static void on_upstream_ready(void *arg)
     }
 }
 
-static void on_shared_ts(shared_buffer_t *shared, const uint8_t *ts)
+static void on_shared_ts(module_data_t *mod, const uint8_t *ts)
 {
+    shared_buffer_t *shared = mod->shared;
+
     if(shared->size == 0)
         return;
 
@@ -391,8 +394,16 @@ static void on_upstream_send(void *arg)
 
     if(shared->__stream.parent == NULL)
     {
-        shared->__stream.on_ts = (void (*)(module_data_t *, const uint8_t *))on_shared_ts;
-        shared->__stream.self = shared;
+        module_data_t *shared_mod = shared->mod;
+        if(shared_mod == NULL)
+        {
+            shared_mod = (module_data_t *)calloc(1, sizeof(module_data_t));
+            shared->mod = shared_mod;
+        }
+
+        shared_mod->shared = shared;
+        shared->__stream.on_ts = on_shared_ts;
+        shared->__stream.self = shared_mod;
         __module_stream_init(&shared->__stream);
         __module_stream_attach(upstream, &shared->__stream);
     }
@@ -553,6 +564,9 @@ static void module_destroy(module_data_t *mod)
             __module_stream_destroy(&shared->__stream);
             shared->__stream.self = NULL;
         }
+
+        free(shared->mod);
+        shared->mod = NULL;
 
         free(shared->buffer);
         free(shared);
