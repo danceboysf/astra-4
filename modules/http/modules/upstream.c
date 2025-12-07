@@ -53,6 +53,9 @@ typedef struct shared_buffer_t
     size_t count;
     size_t write;
 
+    size_t key_start;
+    bool key_valid;
+
     struct shared_buffer_t *next;
 } shared_buffer_t;
 
@@ -89,35 +92,97 @@ struct http_response_t
     bool is_socket_busy;
 };
 
-static size_t shared_buffer_copy(shared_buffer_t *shared, uint8_t *dst, size_t dst_size)
+static size_t shared_buffer_copy_from(shared_buffer_t *shared, uint8_t *dst, size_t dst_size, size_t start_offset)
 {
     if(shared == NULL || shared->count == 0 || dst_size == 0)
         return 0;
 
-    size_t copy_len = (shared->count < dst_size)
-                      ? shared->count
-                      : dst_size;
+    const size_t oldest = (shared->write + shared->size - shared->count) % shared->size;
+    const size_t start = (start_offset == SIZE_MAX) ? oldest : start_offset;
+    const size_t distance_from_oldest = (start + shared->size - oldest) % shared->size;
 
+    if(distance_from_oldest >= shared->count)
+        return 0;
+
+    size_t available = shared->count - distance_from_oldest;
+    size_t copy_len = (available < dst_size) ? available : dst_size;
     copy_len = copy_len - (copy_len % TS_PACKET_SIZE);
 
     if(copy_len == 0)
         return 0;
 
-    const size_t shared_read = (shared->write + shared->size - shared->count)
-                               % shared->size;
-
-    if(shared_read + copy_len <= shared->size)
+    if(start + copy_len <= shared->size)
     {
-        memcpy(dst, &shared->buffer[shared_read], copy_len);
+        memcpy(dst, &shared->buffer[start], copy_len);
     }
     else
     {
-        const size_t head = shared->size - shared_read;
-        memcpy(dst, &shared->buffer[shared_read], head);
+        const size_t head = shared->size - start;
+        memcpy(dst, &shared->buffer[start], head);
         memcpy(&dst[head], shared->buffer, copy_len - head);
     }
 
     return copy_len;
+}
+
+static bool ts_is_keyframe(const uint8_t *ts)
+{
+    if(ts[0] != 0x47)
+        return false;
+
+    const uint8_t afc = (ts[3] >> 4) & 0x3;
+    if(afc == 0 || afc == 2)
+        return false;
+
+    size_t offset = 4;
+    if(afc == 3)
+    {
+        const uint8_t af_len = ts[4];
+        offset += 1 + af_len;
+        if(offset >= TS_PACKET_SIZE)
+            return false;
+    }
+
+    const uint8_t *payload = &ts[offset];
+    size_t payload_len = TS_PACKET_SIZE - offset;
+
+    if(payload_len < 4)
+        return false;
+
+    /*
+     * Scan for a PES start followed by an IDR NAL (type 5). This keeps burst
+     * preloads aligned with key frames to avoid corrupted decoders when the
+     * burst starts mid-GOP.
+     */
+    for(size_t i = 0; i + 4 <= payload_len; ++i)
+    {
+        if(payload[i] == 0x00 && payload[i + 1] == 0x00 && payload[i + 2] == 0x01)
+        {
+            const uint8_t stream_id = payload[i + 3];
+            if(stream_id < 0xE0 || stream_id > 0xEF)
+                continue;
+
+            if(i + 9 > payload_len)
+                break;
+
+            const uint8_t header_data_len = payload[i + 8];
+            const size_t pes_payload = i + 9 + header_data_len;
+            if(pes_payload >= payload_len)
+                return false;
+
+            for(size_t j = pes_payload; j + 4 <= payload_len; ++j)
+            {
+                if(payload[j] == 0x00 && payload[j + 1] == 0x00 && payload[j + 2] == 0x01)
+                {
+                    const uint8_t nal_type = payload[j + 3] & 0x1F;
+                    if(nal_type == 5)
+                        return true;
+                }
+            }
+        }
+    }
+
+    return false;
 }
 
 /*
@@ -225,6 +290,20 @@ static void on_shared_ts(module_data_t *mod, const uint8_t *ts)
     shared->count += TS_PACKET_SIZE;
     if(shared->count > shared->size)
         shared->count = shared->size;
+
+    const size_t oldest = (shared->write + shared->size - shared->count) % shared->size;
+    if(shared->key_valid)
+    {
+        const size_t distance_from_oldest = (shared->key_start + shared->size - oldest) % shared->size;
+        if(distance_from_oldest >= shared->count)
+            shared->key_valid = false;
+    }
+
+    if(ts_is_keyframe(ts))
+    {
+        shared->key_start = write_pos;
+        shared->key_valid = true;
+    }
 }
 
 static void on_ts(void *arg, const uint8_t *ts)
@@ -448,9 +527,21 @@ static void on_upstream_send(void *arg)
         const size_t preload_target = ts_align_down((client->response->burst_target < client->response->buffer_size)
                                                     ? client->response->burst_target
                                                     : (client->response->buffer_size - TS_PACKET_SIZE));
-        const size_t preload = shared_buffer_copy(  shared
-                                                 , client->response->buffer
-                                                 , preload_target);
+
+        size_t preload = 0;
+        if(shared->key_valid)
+        {
+            const size_t oldest = (shared->write + shared->size - shared->count) % shared->size;
+            const size_t distance_from_oldest = (shared->key_start + shared->size - oldest) % shared->size;
+            if(distance_from_oldest < shared->count)
+            {
+                preload = shared_buffer_copy_from(shared
+                                                  , client->response->buffer
+                                                  , preload_target
+                                                  , shared->key_start);
+            }
+        }
+
         client->response->buffer_count = preload;
         client->response->buffer_write = preload % client->response->buffer_size;
         client->response->buffer_read = 0;

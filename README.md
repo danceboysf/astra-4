@@ -29,4 +29,6 @@ prefill (5120 KB), the following relay invocations stay valid:
   (80 KB of margin still satisfies the one-packet rule.)
 
 Any other values work as long as `buffer_size > burst_size` and the gap is at
-least 188 bytes.
+least 188 bytes. Burst reuse is aligned to the most recent detected key frame
+in the shared ring buffer so clients begin decoding cleanly when the prefill is
+sent.
