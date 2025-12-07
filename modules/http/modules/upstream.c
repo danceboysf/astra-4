@@ -42,16 +42,26 @@ static inline size_t ts_align_or_default(size_t value, size_t fallback)
     return aligned;
 }
 
+typedef struct shared_buffer_t
+{
+    module_stream_t __stream;
+    module_stream_t *upstream;
+
+    uint8_t *buffer;
+    size_t size;
+    size_t count;
+    size_t write;
+
+    struct shared_buffer_t *next;
+} shared_buffer_t;
+
 struct module_data_t
 {
     int idx_callback;
 
     MODULE_STREAM_DATA();
 
-    uint8_t *shared_buffer;
-    size_t shared_size;
-    size_t shared_count;
-    size_t shared_write;
+    shared_buffer_t *shared;
 };
 
 struct http_response_t
@@ -59,6 +69,7 @@ struct http_response_t
     MODULE_STREAM_DATA();
 
     module_data_t *mod;
+    shared_buffer_t *shared;
 
     uint8_t *buffer;
     size_t buffer_count;
@@ -77,13 +88,13 @@ struct http_response_t
     bool is_socket_busy;
 };
 
-static size_t shared_buffer_copy(module_data_t *mod, uint8_t *dst, size_t dst_size)
+static size_t shared_buffer_copy(shared_buffer_t *shared, uint8_t *dst, size_t dst_size)
 {
-    if(mod->shared_count == 0 || dst_size == 0)
+    if(shared == NULL || shared->count == 0 || dst_size == 0)
         return 0;
 
-    size_t copy_len = (mod->shared_count < dst_size)
-                      ? mod->shared_count
+    size_t copy_len = (shared->count < dst_size)
+                      ? shared->count
                       : dst_size;
 
     copy_len = copy_len - (copy_len % TS_PACKET_SIZE);
@@ -91,18 +102,18 @@ static size_t shared_buffer_copy(module_data_t *mod, uint8_t *dst, size_t dst_si
     if(copy_len == 0)
         return 0;
 
-    const size_t shared_read = (mod->shared_write + mod->shared_size - mod->shared_count)
-                               % mod->shared_size;
+    const size_t shared_read = (shared->write + shared->size - shared->count)
+                               % shared->size;
 
-    if(shared_read + copy_len <= mod->shared_size)
+    if(shared_read + copy_len <= shared->size)
     {
-        memcpy(dst, &mod->shared_buffer[shared_read], copy_len);
+        memcpy(dst, &shared->buffer[shared_read], copy_len);
     }
     else
     {
-        const size_t head = mod->shared_size - shared_read;
-        memcpy(dst, &mod->shared_buffer[shared_read], head);
-        memcpy(&dst[head], mod->shared_buffer, copy_len - head);
+        const size_t head = shared->size - shared_read;
+        memcpy(dst, &shared->buffer[shared_read], head);
+        memcpy(&dst[head], shared->buffer, copy_len - head);
     }
 
     return copy_len;
@@ -173,34 +184,34 @@ static void on_upstream_ready(void *arg)
     }
 }
 
-static void on_shared_ts(module_data_t *mod, const uint8_t *ts)
+static void on_shared_ts(shared_buffer_t *shared, const uint8_t *ts)
 {
-    if(mod->shared_size == 0)
+    if(shared->size == 0)
         return;
 
-    if(mod->shared_count + TS_PACKET_SIZE > mod->shared_size)
+    if(shared->count + TS_PACKET_SIZE > shared->size)
     {
         // overwrite the oldest packet to keep the newest burstable data
-        mod->shared_count -= TS_PACKET_SIZE;
+        shared->count -= TS_PACKET_SIZE;
     }
 
-    const size_t write_pos = mod->shared_write;
-    if(write_pos + TS_PACKET_SIZE <= mod->shared_size)
+    const size_t write_pos = shared->write;
+    if(write_pos + TS_PACKET_SIZE <= shared->size)
     {
-        memcpy(&mod->shared_buffer[write_pos], ts, TS_PACKET_SIZE);
-        mod->shared_write = (write_pos + TS_PACKET_SIZE) % mod->shared_size;
+        memcpy(&shared->buffer[write_pos], ts, TS_PACKET_SIZE);
+        shared->write = (write_pos + TS_PACKET_SIZE) % shared->size;
     }
     else
     {
-        const size_t head = mod->shared_size - write_pos;
-        memcpy(&mod->shared_buffer[write_pos], ts, head);
-        memcpy(mod->shared_buffer, &ts[head], TS_PACKET_SIZE - head);
-        mod->shared_write = TS_PACKET_SIZE - head;
+        const size_t head = shared->size - write_pos;
+        memcpy(&shared->buffer[write_pos], ts, head);
+        memcpy(shared->buffer, &ts[head], TS_PACKET_SIZE - head);
+        shared->write = TS_PACKET_SIZE - head;
     }
 
-    mod->shared_count += TS_PACKET_SIZE;
-    if(mod->shared_count > mod->shared_size)
-        mod->shared_count = mod->shared_size;
+    shared->count += TS_PACKET_SIZE;
+    if(shared->count > shared->size)
+        shared->count = shared->size;
 }
 
 static void on_ts(void *arg, const uint8_t *ts)
@@ -366,12 +377,24 @@ static void on_upstream_send(void *arg)
         return;
     }
 
-    if(mod->__stream.parent == NULL)
+    shared_buffer_t *shared = mod->shared;
+    while(shared && shared->upstream != upstream)
+        shared = shared->next;
+
+    if(!shared)
     {
-        mod->__stream.on_ts = (void (*)(module_data_t *, const uint8_t *))on_shared_ts;
-        mod->__stream.self = mod;
-        __module_stream_init(&mod->__stream);
-        __module_stream_attach(upstream, &mod->__stream);
+        shared = (shared_buffer_t *)calloc(1, sizeof(shared_buffer_t));
+        shared->upstream = upstream;
+        shared->next = mod->shared;
+        mod->shared = shared;
+    }
+
+    if(shared->__stream.parent == NULL)
+    {
+        shared->__stream.on_ts = (void (*)(module_data_t *, const uint8_t *))on_shared_ts;
+        shared->__stream.self = shared;
+        __module_stream_init(&shared->__stream);
+        __module_stream_attach(upstream, &shared->__stream);
     }
 
     const size_t desired_shared = ts_align_or_default((client->response->burst_fill > client->response->buffer_size)
@@ -379,22 +402,32 @@ static void on_upstream_send(void *arg)
                                                       : client->response->buffer_size,
                                                       client->response->buffer_size);
 
-    if(mod->shared_size < desired_shared)
+    if(shared->size < desired_shared)
     {
-        mod->shared_buffer = (uint8_t *)realloc(mod->shared_buffer, desired_shared);
-        mod->shared_size = desired_shared;
-        mod->shared_count = 0;
-        mod->shared_write = 0;
+        shared->buffer = (uint8_t *)realloc(shared->buffer, desired_shared);
+        shared->size = desired_shared;
+        if(shared->buffer == NULL)
+        {
+            http_client_abort(client, 500, "failed to allocate shared buffer");
+            return;
+        }
+        if(shared->count > desired_shared)
+        {
+            shared->count = 0;
+            shared->write = 0;
+        }
     }
+
+    client->response->shared = shared;
 
     client->response->buffer = (uint8_t *)malloc(client->response->buffer_size);
 
-    if(mod->shared_buffer && mod->shared_count > 0)
+    if(shared->buffer && shared->count > 0)
     {
         const size_t preload_target = ts_align_down((client->response->burst_target < client->response->buffer_size)
                                                     ? client->response->burst_target
                                                     : (client->response->buffer_size - TS_PACKET_SIZE));
-        const size_t preload = shared_buffer_copy(  mod
+        const size_t preload = shared_buffer_copy(  shared
                                                  , client->response->buffer
                                                  , preload_target);
         client->response->buffer_count = preload;
@@ -475,10 +508,7 @@ static void module_init(module_data_t *mod)
     mod->idx_callback = luaL_ref(lua, LUA_REGISTRYINDEX);
 
     mod->__stream.self = NULL;
-    mod->shared_buffer = NULL;
-    mod->shared_size = 0;
-    mod->shared_count = 0;
-    mod->shared_write = 0;
+    mod->shared = NULL;
 
     // Deprecated
     bool is_deprecated = false;
@@ -513,17 +543,23 @@ static void module_destroy(module_data_t *mod)
         mod->idx_callback = 0;
     }
 
-    if(mod->__stream.self)
+    shared_buffer_t *shared = mod->shared;
+    while(shared)
     {
-        __module_stream_destroy(&mod->__stream);
-        mod->__stream.self = NULL;
+        shared_buffer_t *next = shared->next;
+
+        if(shared->__stream.self)
+        {
+            __module_stream_destroy(&shared->__stream);
+            shared->__stream.self = NULL;
+        }
+
+        free(shared->buffer);
+        free(shared);
+        shared = next;
     }
 
-    free(mod->shared_buffer);
-    mod->shared_buffer = NULL;
-    mod->shared_size = 0;
-    mod->shared_count = 0;
-    mod->shared_write = 0;
+    mod->shared = NULL;
 }
 
 MODULE_LUA_METHODS()
