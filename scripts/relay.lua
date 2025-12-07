@@ -237,6 +237,7 @@ function on_request_udp(server, client, request)
             upstream = client_data.input.tail:stream(),
             buffer_size = relay_buffer_size,
             buffer_fill = relay_buffer_fill,
+            burst_size = relay_burst_size,
         })
     end
 
@@ -275,6 +276,7 @@ function on_request_http(server, client, request)
             upstream = client_data.input.tail:stream(),
             buffer_size = relay_buffer_size,
             buffer_fill = relay_buffer_fill,
+            burst_size = relay_burst_size,
         })
     end
 
@@ -329,6 +331,7 @@ function on_request_channel(server, client, request)
             upstream = client_data.input.tail:stream(),
             buffer_size = relay_buffer_size,
             buffer_fill = relay_buffer_fill,
+            burst_size = relay_burst_size,
         })
     end
 
@@ -346,6 +349,7 @@ relay_port = 8000
 
 relay_buffer_size = nil
 relay_buffer_fill = nil
+relay_burst_size = nil
 
 relay_allow_udp = true
 relay_allow_http = true
@@ -364,6 +368,7 @@ options_usage = [[
     -l ADDR             source interface for UDP/RTP streams
     --buffer-size       buffer size in Kb (default: 1024)
     --buffer-fill       minimal packet size in Kb (default: 128)
+    --burst-size        initial burst size in Kb (disabled by default)
     --no-udp            disable direct access the to UDP/RTP source
     --no-http           disable direct access the to HTTP source
     --pass              basic authentication for statistics. login:password
@@ -393,6 +398,10 @@ options = {
     end,
     ["--buffer-fill"] =  function(idx)
         relay_buffer_fill = tonumber(argv[idx + 1])
+        return 1
+    end,
+    ["--burst-size"] =  function(idx)
+        relay_burst_size = tonumber(argv[idx + 1])
         return 1
     end,
     ["--channels"] = function(idx)

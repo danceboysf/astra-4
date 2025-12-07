@@ -43,6 +43,9 @@ struct http_response_t
     size_t buffer_size;
     size_t buffer_fill;
 
+    size_t burst_fill;
+    bool is_burst_done;
+
     bool is_socket_busy;
 };
 
@@ -131,9 +134,14 @@ static void on_ts(void *arg, const uint8_t *ts)
     }
     response->buffer_count += TS_PACKET_SIZE;
 
+    const size_t start_fill = response->is_burst_done
+                            ? response->buffer_fill
+                            : response->burst_fill;
+
     if(   response->is_socket_busy == false
-       && response->buffer_count >= response->buffer_fill)
+       && response->buffer_count >= start_fill)
     {
+        response->is_burst_done = true;
         asc_socket_set_on_ready(client->sock, on_upstream_ready);
         response->is_socket_busy = true;
     }
@@ -156,6 +164,8 @@ static void on_upstream_send(void *arg)
 
     client->response->buffer_size = DEFAULT_BUFFER_SIZE;
     client->response->buffer_fill = DEFAULT_BUFFER_FILL;
+    client->response->burst_fill = DEFAULT_BUFFER_FILL;
+    client->response->is_burst_done = true;
 
     if(lua_istable(lua, 3))
     {
@@ -182,9 +192,27 @@ static void on_upstream_send(void *arg)
         }
         lua_pop(lua, 1);
 
+        lua_getfield(lua, 3, "burst_size");
+        if(lua_isnumber(lua, -1))
+        {
+            client->response->burst_fill = lua_tonumber(lua, -1) * 1024;
+            if(client->response->burst_fill == 0)
+                client->response->burst_fill = DEFAULT_BUFFER_FILL;
+            else
+                client->response->is_burst_done = false;
+        }
+        lua_pop(lua, 1);
+
         if(client->response->buffer_size <= client->response->buffer_fill)
         {
             http_client_error(client, "buffer_size must be greater than buffer_fill");
+            http_client_abort(client, 500, "server configuration error");
+            return;
+        }
+
+        if(client->response->buffer_size <= client->response->burst_fill)
+        {
+            http_client_error(client, "buffer_size must be greater than burst_size");
             http_client_abort(client, 500, "server configuration error");
             return;
         }
