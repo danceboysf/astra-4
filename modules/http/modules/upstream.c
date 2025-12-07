@@ -24,6 +24,24 @@
 #define DEFAULT_BUFFER_SIZE (1024 * 1024)
 #define DEFAULT_BUFFER_FILL (128 * 1024)
 
+static inline size_t ts_align_down(size_t bytes)
+{
+    return bytes - (bytes % TS_PACKET_SIZE);
+}
+
+static inline size_t ts_align_or_default(size_t value, size_t fallback)
+{
+    size_t aligned = ts_align_down(value);
+
+    if(aligned < TS_PACKET_SIZE)
+        aligned = ts_align_down(fallback);
+
+    if(aligned < TS_PACKET_SIZE)
+        aligned = TS_PACKET_SIZE;
+
+    return aligned;
+}
+
 struct module_data_t
 {
     int idx_callback;
@@ -64,9 +82,14 @@ static size_t shared_buffer_copy(module_data_t *mod, uint8_t *dst, size_t dst_si
     if(mod->shared_count == 0 || dst_size == 0)
         return 0;
 
-    const size_t copy_len = (mod->shared_count < dst_size)
-                            ? mod->shared_count
-                            : dst_size;
+    size_t copy_len = (mod->shared_count < dst_size)
+                      ? mod->shared_count
+                      : dst_size;
+
+    copy_len = copy_len - (copy_len % TS_PACKET_SIZE);
+
+    if(copy_len == 0)
+        return 0;
 
     const size_t shared_read = (mod->shared_write + mod->shared_size - mod->shared_count)
                                % mod->shared_size;
@@ -282,7 +305,12 @@ static void on_upstream_send(void *arg)
         }
         lua_pop(lua, 1);
 
-        const size_t min_size = TS_PACKET_SIZE + 1;
+        client->response->buffer_size = ts_align_or_default(client->response->buffer_size, DEFAULT_BUFFER_SIZE);
+        client->response->buffer_fill = ts_align_or_default(client->response->buffer_fill, DEFAULT_BUFFER_FILL);
+        client->response->burst_fill = ts_align_or_default(client->response->burst_fill, DEFAULT_BUFFER_FILL);
+        client->response->burst_target = client->response->burst_fill;
+
+        const size_t min_size = TS_PACKET_SIZE;
 
         if(client->response->buffer_size <= client->response->buffer_fill)
         {
@@ -315,6 +343,11 @@ static void on_upstream_send(void *arg)
         upstream = (module_stream_t *)lua_touserdata(lua, 3);
     }
 
+    client->response->buffer_size = ts_align_or_default(client->response->buffer_size, DEFAULT_BUFFER_SIZE);
+    client->response->buffer_fill = ts_align_or_default(client->response->buffer_fill, DEFAULT_BUFFER_FILL);
+    client->response->burst_fill = ts_align_or_default(client->response->burst_fill, DEFAULT_BUFFER_FILL);
+    client->response->burst_target = client->response->burst_fill;
+
     if(!upstream)
     {
         http_client_abort(client, 500, ":send() client instance required");
@@ -329,9 +362,10 @@ static void on_upstream_send(void *arg)
         __module_stream_attach(upstream, &mod->__stream);
     }
 
-    const size_t desired_shared = (client->response->burst_fill > client->response->buffer_size)
-                                  ? client->response->burst_fill
-                                  : client->response->buffer_size;
+    const size_t desired_shared = ts_align_or_default((client->response->burst_fill > client->response->buffer_size)
+                                                      ? client->response->burst_fill
+                                                      : client->response->buffer_size,
+                                                      client->response->buffer_size);
 
     if(mod->shared_size < desired_shared)
     {
@@ -345,11 +379,12 @@ static void on_upstream_send(void *arg)
 
     if(mod->shared_buffer && mod->shared_count > 0)
     {
-        const size_t preload = shared_buffer_copy(  mod
-                                                 , client->response->buffer
-                                                 , (client->response->burst_target < client->response->buffer_size)
+        const size_t preload_target = ts_align_down((client->response->burst_target < client->response->buffer_size)
                                                     ? client->response->burst_target
                                                     : (client->response->buffer_size - TS_PACKET_SIZE));
+        const size_t preload = shared_buffer_copy(  mod
+                                                 , client->response->buffer
+                                                 , preload_target);
         client->response->buffer_count = preload;
         client->response->buffer_write = preload % client->response->buffer_size;
         client->response->buffer_read = 0;
