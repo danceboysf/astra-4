@@ -130,7 +130,7 @@ static void on_upstream_ready(void *arg)
     http_client_t *client = (http_client_t *)arg;
     http_response_t *response = client->response;
 
-    if(response->buffer_count > 0)
+    while(response->buffer_count >= TS_PACKET_SIZE)
     {
         size_t block_size = (response->buffer_write > response->buffer_read)
                           ? (response->buffer_write - response->buffer_read)
@@ -142,7 +142,7 @@ static void on_upstream_ready(void *arg)
         block_size = ts_align_down(block_size);
 
         if(block_size < TS_PACKET_SIZE)
-            return;
+            break;
 
         const ssize_t send_size = asc_socket_send(  client->sock
                                                   , &response->buffer[response->buffer_read]
@@ -150,23 +150,33 @@ static void on_upstream_ready(void *arg)
 
         if(send_size > 0)
         {
-            if(send_size % TS_PACKET_SIZE != 0)
+            const size_t aligned_send = ts_align_down(send_size);
+
+            if(aligned_send > 0)
             {
-                http_client_error(client, "partial TS frame sent (%zd bytes)", send_size);
-                http_client_close(client);
-                return;
+                response->buffer_count -= aligned_send;
+                response->buffer_read += aligned_send;
+                if(response->buffer_read >= response->buffer_size)
+                    response->buffer_read = 0;
+
+                if(!response->is_burst_done)
+                {
+                    response->burst_sent += aligned_send;
+                    if(response->burst_sent >= response->burst_target)
+                        response->is_burst_done = true;
+                }
             }
 
-            response->buffer_count -= send_size;
-            response->buffer_read += send_size;
-            if(response->buffer_read >= response->buffer_size)
-                response->buffer_read = 0;
-
-            if(!response->is_burst_done)
+            /*
+             * If the kernel performed a short or unaligned write, leave the remaining
+             * data in the buffer to retry on the next ready event instead of
+             * aborting the connection. This avoids sending truncated TS packets
+             * when the socket back-pressure splits a frame.
+             */
+            if(  (size_t)send_size < block_size
+               || (size_t)send_size != aligned_send)
             {
-                response->burst_sent += send_size;
-                if(response->burst_sent >= response->burst_target)
-                    response->is_burst_done = true;
+                break;
             }
         }
         else if(send_size == -1)
