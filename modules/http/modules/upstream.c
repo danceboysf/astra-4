@@ -127,12 +127,24 @@ static void on_upstream_ready(void *arg)
         if(block_size > response->buffer_count)
             block_size = response->buffer_count;
 
+        block_size = ts_align_down(block_size);
+
+        if(block_size < TS_PACKET_SIZE)
+            return;
+
         const ssize_t send_size = asc_socket_send(  client->sock
                                                   , &response->buffer[response->buffer_read]
                                                   , block_size);
 
         if(send_size > 0)
         {
+            if(send_size % TS_PACKET_SIZE != 0)
+            {
+                http_client_error(client, "partial TS frame sent (%zd bytes)", send_size);
+                http_client_close(client);
+                return;
+            }
+
             response->buffer_count -= send_size;
             response->buffer_read += send_size;
             if(response->buffer_read >= response->buffer_size)
