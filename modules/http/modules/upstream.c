@@ -524,6 +524,80 @@ static bool response_enqueue_ts(http_client_t *client, const uint8_t *ts, bool d
     return true;
 }
 
+static bool response_send_cached_keyframe(http_client_t *client)
+{
+    http_response_t *response = client->response;
+    shared_buffer_t *shared = response->shared;
+
+    if(shared == NULL)
+        return false;
+
+    if(!shared->key_valid)
+        return false;
+
+    bool mark_discontinuity = true;
+    bool has_enqueued = false;
+
+    if(shared->pat_valid)
+    {
+        has_enqueued |= response_enqueue_ts(client, shared->pat, mark_discontinuity);
+    }
+
+    if(shared->pmt_valid)
+    {
+        has_enqueued |= response_enqueue_ts(client, shared->pmt, mark_discontinuity);
+        mark_discontinuity = false;
+    }
+
+    const size_t burst_budget = response->burst_target ? response->burst_target
+                                                        : response->buffer_fill;
+    const size_t copy_limit = ts_align_down(burst_budget);
+
+    size_t copied = 0;
+    size_t offset = shared->key_start;
+
+    while(copied < copy_limit)
+    {
+        uint8_t chunk[TS_PACKET_SIZE * 32];
+        const size_t remaining = copy_limit - copied;
+        const size_t request = (remaining < sizeof(chunk)) ? remaining : sizeof(chunk);
+        const size_t chunk_size = shared_buffer_copy_from(shared, chunk, request, offset);
+
+        if(chunk_size == 0)
+            break;
+
+        offset = (offset + chunk_size) % shared->size;
+        copied += chunk_size;
+
+        for(size_t i = 0; i + TS_PACKET_SIZE <= chunk_size; i += TS_PACKET_SIZE)
+        {
+            if(response_enqueue_ts(client, &chunk[i], mark_discontinuity))
+            {
+                has_enqueued = true;
+            }
+            else
+            {
+                break;
+            }
+
+            mark_discontinuity = false;
+        }
+    }
+
+    if(has_enqueued)
+    {
+        response->waiting_for_keyframe = false;
+
+        if(response->is_socket_busy == false && response->buffer_count >= TS_PACKET_SIZE)
+        {
+            asc_socket_set_on_ready(client->sock, on_upstream_ready);
+            response->is_socket_busy = true;
+        }
+    }
+
+    return has_enqueued;
+}
+
 static void on_ts(void *arg, const uint8_t *ts)
 {
     http_client_t *client = (http_client_t *)arg;
@@ -836,6 +910,10 @@ static void on_upstream_send(void *arg)
     http_response_header(client, "Content-Type: %s", content_type);
     http_response_header(client, "Connection: close");
     http_response_send(client);
+
+    // If we already have a cached keyframe for this stream, prefill immediately
+    // so new clients get a burst without waiting for the next GOP boundary.
+    response_send_cached_keyframe(client);
 }
 
 static int module_call(module_data_t *mod)
