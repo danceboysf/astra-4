@@ -425,6 +425,7 @@ function http_output_on_request(server, client, request)
             upstream = channel_data.tail:stream(),
             buffer_size = client_data.output_data.config.buffer_size,
             buffer_fill = client_data.output_data.config.buffer_fill,
+            burst_size = client_data.output_data.config.burst_size,
         })
     end
 
@@ -504,6 +505,7 @@ init_output_module.np = function(channel_data, output_id)
         upstream = channel_data.tail:stream(),
         buffer_size = conf.buffer_size,
         buffer_fill = conf.buffer_size,
+        burst_size = conf.burst_size,
         timeout = conf.timeout,
         sctp = conf.sctp,
         headers = {

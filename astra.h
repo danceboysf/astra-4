@@ -38,12 +38,18 @@
                  _VSTR(ASTRA_VERSION_MINOR) "." \
                  _VSTR(ASTRA_VERSION_PATCH)
 
+#ifdef ASTRA_VERSION_SUFFIX
+#   define _VSUFFIX "-" ASTRA_VERSION_SUFFIX
+#else
+#   define _VSUFFIX ""
+#endif
+
 #ifdef DEBUG
 #   define _VDEBUG " debug"
 #else
 #   define _VDEBUG
 #endif
 
-#define ASTRA_VERSION_STR _VERSION _VDEBUG
+#define ASTRA_VERSION_STR _VERSION _VSUFFIX _VDEBUG
 
 #endif /* _ASTRA_H_ */
