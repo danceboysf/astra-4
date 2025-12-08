@@ -42,11 +42,68 @@ static inline size_t ts_align_or_default(size_t value, size_t fallback)
     return aligned;
 }
 
+static inline uint16_t ts_pid(const uint8_t *ts)
+{
+    return ((uint16_t)(ts[1] & 0x1F) << 8) | ts[2];
+}
+
+static inline bool ts_payload_unit_start(const uint8_t *ts)
+{
+    return (ts[1] & 0x40) != 0;
+}
+
+static const uint8_t *ts_payload(const uint8_t *ts, size_t *payload_len)
+{
+    const uint8_t afc = (ts[3] >> 4) & 0x3;
+    if(afc == 0 || afc == 2)
+        return NULL;
+
+    size_t offset = 4;
+    if(afc == 3)
+    {
+        const uint8_t af_len = ts[4];
+        offset += 1 + af_len;
+        if(offset >= TS_PACKET_SIZE)
+            return NULL;
+    }
+
+    *payload_len = TS_PACKET_SIZE - offset;
+    return &ts[offset];
+}
+
+static void ts_mark_discontinuity(uint8_t *ts)
+{
+    const uint8_t afc = (ts[3] >> 4) & 0x3;
+    if(afc == 0)
+        return;
+
+    if(afc == 1)
+    {
+        // no adaptation field present to toggle safely without shrinking payload
+        return;
+    }
+
+    uint8_t *flags = &ts[5];
+    const uint8_t af_len = ts[4];
+    if(af_len == 0)
+        return;
+
+    *flags |= 0x80; // discontinuity_indicator
+}
+
 typedef struct shared_buffer_t
 {
     module_stream_t __stream;
     module_data_t *mod;
     module_stream_t *upstream;
+
+    uint8_t pat[TS_PACKET_SIZE];
+    uint8_t pmt[TS_PACKET_SIZE];
+    bool pat_valid;
+    bool pmt_valid;
+    uint16_t pmt_pid;
+    uint16_t video_pid;
+    uint16_t pcr_pid;
 
     uint8_t *buffer;
     size_t size;
@@ -74,6 +131,8 @@ struct http_response_t
 
     module_data_t *mod;
     shared_buffer_t *shared;
+
+    bool waiting_for_keyframe;
 
     uint8_t *buffer;
     size_t buffer_count;
@@ -125,9 +184,12 @@ static size_t shared_buffer_copy_from(shared_buffer_t *shared, uint8_t *dst, siz
     return copy_len;
 }
 
-static bool ts_is_keyframe(const uint8_t *ts)
+static bool ts_is_keyframe(const uint8_t *ts, uint16_t video_pid)
 {
     if(ts[0] != 0x47)
+        return false;
+
+    if(video_pid != 0 && ts_pid(ts) != video_pid)
         return false;
 
     const uint8_t afc = (ts[3] >> 4) & 0x3;
@@ -183,6 +245,103 @@ static bool ts_is_keyframe(const uint8_t *ts)
     }
 
     return false;
+}
+
+static bool ts_parse_pat(const uint8_t *ts, shared_buffer_t *shared)
+{
+    size_t payload_len = 0;
+    const uint8_t *payload = ts_payload(ts, &payload_len);
+    if(!payload || payload_len < 1)
+        return false;
+
+    if(ts_payload_unit_start(ts))
+    {
+        const uint8_t pointer = payload[0];
+        if(1 + pointer >= payload_len)
+            return false;
+
+        payload += 1 + pointer;
+        payload_len -= 1 + pointer;
+    }
+
+    if(payload_len < 8 || payload[0] != 0x00)
+        return false;
+
+    const uint16_t section_length = ((payload[1] & 0x0F) << 8) | payload[2];
+    if(section_length + 3 > payload_len || section_length < 9)
+        return false;
+
+    size_t offset = 8;
+    const size_t programs_end = 3 + section_length - 4;
+    while(offset + 4 <= programs_end)
+    {
+        const uint16_t program = ((uint16_t)payload[offset] << 8) | payload[offset + 1];
+        const uint16_t pid = ((uint16_t)(payload[offset + 2] & 0x1F) << 8) | payload[offset + 3];
+        offset += 4;
+
+        if(program == 0)
+            continue;
+
+        shared->pmt_pid = pid;
+        shared->pat_valid = true;
+        memcpy(shared->pat, ts, TS_PACKET_SIZE);
+        return true;
+    }
+
+    return false;
+}
+
+static bool ts_parse_pmt(const uint8_t *ts, shared_buffer_t *shared)
+{
+    if(shared->pmt_pid == 0)
+        return false;
+
+    if(ts_pid(ts) != shared->pmt_pid)
+        return false;
+
+    size_t payload_len = 0;
+    const uint8_t *payload = ts_payload(ts, &payload_len);
+    if(!payload || payload_len < 1)
+        return false;
+
+    if(ts_payload_unit_start(ts))
+    {
+        const uint8_t pointer = payload[0];
+        if(1 + pointer >= payload_len)
+            return false;
+
+        payload += 1 + pointer;
+        payload_len -= 1 + pointer;
+    }
+
+    if(payload_len < 12 || payload[0] != 0x02)
+        return false;
+
+    const uint16_t section_length = ((payload[1] & 0x0F) << 8) | payload[2];
+    if(section_length + 3 > payload_len || section_length < 9)
+        return false;
+
+    shared->pcr_pid = ((uint16_t)(payload[8] & 0x1F) << 8) | payload[9];
+    const uint16_t program_info_len = ((uint16_t)(payload[10] & 0x0F) << 8) | payload[11];
+
+    size_t offset = 12 + program_info_len;
+    const size_t section_end = 3 + section_length - 4;
+
+    while(offset + 5 <= section_end)
+    {
+        const uint8_t stream_type = payload[offset];
+        const uint16_t pid = ((uint16_t)(payload[offset + 1] & 0x1F) << 8) | payload[offset + 2];
+        const uint16_t es_info_len = ((uint16_t)(payload[offset + 3] & 0x0F) << 8) | payload[offset + 4];
+
+        if(stream_type == 0x1B || stream_type == 0x24)
+            shared->video_pid = pid;
+
+        offset += 5 + es_info_len;
+    }
+
+    shared->pmt_valid = true;
+    memcpy(shared->pmt, ts, TS_PACKET_SIZE);
+    return true;
 }
 
 /*
@@ -298,17 +457,21 @@ static void on_shared_ts(module_data_t *mod, const uint8_t *ts)
         if(distance_from_oldest >= shared->count)
             shared->key_valid = false;
     }
+    const uint16_t pid = ts_pid(ts);
+    if(pid == 0)
+        ts_parse_pat(ts, shared);
+    else if(pid == shared->pmt_pid)
+        ts_parse_pmt(ts, shared);
 
-    if(ts_is_keyframe(ts))
+    if(shared->video_pid != 0 && ts_is_keyframe(ts, shared->video_pid))
     {
         shared->key_start = write_pos;
         shared->key_valid = true;
     }
 }
 
-static void on_ts(void *arg, const uint8_t *ts)
+static bool response_enqueue_ts(http_client_t *client, const uint8_t *ts, bool discontinuity)
 {
-    http_client_t *client = (http_client_t *)arg;
     http_response_t *response = client->response;
 
     if(response->buffer_count + TS_PACKET_SIZE >= response->buffer_size)
@@ -323,28 +486,86 @@ static void on_ts(void *arg, const uint8_t *ts)
             asc_socket_set_on_ready(client->sock, NULL);
             response->is_socket_busy = false;
         }
-        return;
+        return false;
+    }
+
+    const uint8_t *src = ts;
+    uint8_t ts_copy[TS_PACKET_SIZE];
+    if(discontinuity)
+    {
+        memcpy(ts_copy, ts, TS_PACKET_SIZE);
+        ts_mark_discontinuity(ts_copy);
+        src = ts_copy;
     }
 
     const size_t buffer_write = response->buffer_write + TS_PACKET_SIZE;
     if(buffer_write < response->buffer_size)
     {
-        memcpy(&response->buffer[response->buffer_write], ts, TS_PACKET_SIZE);
+        memcpy(&response->buffer[response->buffer_write], src, TS_PACKET_SIZE);
         response->buffer_write = buffer_write;
     }
     else if(buffer_write > response->buffer_size)
     {
         const size_t ts_head = response->buffer_size - response->buffer_write;
-        memcpy(&response->buffer[response->buffer_write], ts, ts_head);
+        memcpy(&response->buffer[response->buffer_write], src, ts_head);
         response->buffer_write = TS_PACKET_SIZE - ts_head;
-        memcpy(response->buffer, &ts[ts_head], response->buffer_write);
+        memcpy(response->buffer, &src[ts_head], response->buffer_write);
     }
     else
     {
-        memcpy(&response->buffer[response->buffer_write], ts, TS_PACKET_SIZE);
+        memcpy(&response->buffer[response->buffer_write], src, TS_PACKET_SIZE);
         response->buffer_write = 0;
     }
     response->buffer_count += TS_PACKET_SIZE;
+
+    return true;
+}
+
+static void on_ts(void *arg, const uint8_t *ts)
+{
+    http_client_t *client = (http_client_t *)arg;
+    http_response_t *response = client->response;
+    shared_buffer_t *shared = response->shared;
+
+    if(response->waiting_for_keyframe)
+    {
+        const uint16_t pid = ts_pid(ts);
+        const bool has_video_pid = shared && shared->video_pid != 0;
+        const bool is_keyframe = has_video_pid
+                                  ? (pid == shared->video_pid && ts_is_keyframe(ts, shared->video_pid))
+                                  : ts_is_keyframe(ts, 0);
+
+        if(is_keyframe)
+        {
+            bool mark_discontinuity = true;
+
+            if(shared && shared->pat_valid)
+                response_enqueue_ts(client, shared->pat, mark_discontinuity);
+
+            if(shared && shared->pmt_valid)
+            {
+                response_enqueue_ts(client, shared->pmt, mark_discontinuity);
+                mark_discontinuity = false;
+            }
+
+            response_enqueue_ts(client, ts, mark_discontinuity);
+
+            response->waiting_for_keyframe = false;
+
+            size_t start_fill = TS_PACKET_SIZE;
+            if(   response->is_socket_busy == false
+               && response->buffer_count >= start_fill)
+            {
+                asc_socket_set_on_ready(client->sock, on_upstream_ready);
+                response->is_socket_busy = true;
+            }
+        }
+
+        return;
+    }
+
+    if(!response_enqueue_ts(client, ts, false))
+        return;
 
     size_t start_fill = response->is_burst_done
                        ? response->buffer_fill
@@ -522,32 +743,11 @@ static void on_upstream_send(void *arg)
 
     client->response->buffer = (uint8_t *)malloc(client->response->buffer_size);
 
-    if(shared->buffer && shared->count > 0)
-    {
-        const size_t preload_target = ts_align_down((client->response->burst_target < client->response->buffer_size)
-                                                    ? client->response->burst_target
-                                                    : (client->response->buffer_size - TS_PACKET_SIZE));
-
-        size_t preload = 0;
-        if(shared->key_valid)
-        {
-            const size_t oldest = (shared->write + shared->size - shared->count) % shared->size;
-            const size_t distance_from_oldest = (shared->key_start + shared->size - oldest) % shared->size;
-            if(distance_from_oldest < shared->count)
-            {
-                preload = shared_buffer_copy_from(shared
-                                                  , client->response->buffer
-                                                  , preload_target
-                                                  , shared->key_start);
-            }
-        }
-
-        client->response->buffer_count = preload;
-        client->response->buffer_write = preload % client->response->buffer_size;
-        client->response->buffer_read = 0;
-        if(preload > 0)
-            client->response->is_burst_done = false;
-    }
+    client->response->waiting_for_keyframe = true;
+    client->response->buffer_count = 0;
+    client->response->buffer_write = 0;
+    client->response->buffer_read = 0;
+    client->response->is_burst_done = false;
 
     // like module_stream_init()
     client->response->__stream.self = (void *)client;
