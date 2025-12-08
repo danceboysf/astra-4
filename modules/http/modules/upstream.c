@@ -535,6 +535,9 @@ static bool response_send_cached_keyframe(http_client_t *client)
     if(!shared->key_valid)
         return false;
 
+    if(!shared->pat_valid || !shared->pmt_valid)
+        return false;
+
     bool mark_discontinuity = true;
     bool has_enqueued = false;
 
