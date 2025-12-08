@@ -423,6 +423,9 @@ static void on_shared_ts(module_data_t *mod, const uint8_t *ts)
 {
     shared_buffer_t *shared = mod->shared;
 
+    if(ts[0] != 0x47)
+        return;
+
     if(shared->size == 0)
         return;
 
@@ -527,6 +530,22 @@ static void on_ts(void *arg, const uint8_t *ts)
     http_response_t *response = client->response;
     shared_buffer_t *shared = response->shared;
 
+    if(ts[0] != 0x47)
+    {
+        response->waiting_for_keyframe = false;
+
+        if(!response_enqueue_ts(client, ts, false))
+            return;
+
+        if(response->is_socket_busy == false && response->buffer_count >= TS_PACKET_SIZE)
+        {
+            asc_socket_set_on_ready(client->sock, on_upstream_ready);
+            response->is_socket_busy = true;
+        }
+
+        return;
+    }
+
     if(response->waiting_for_keyframe)
     {
         const uint16_t pid = ts_pid(ts);
@@ -539,16 +558,65 @@ static void on_ts(void *arg, const uint8_t *ts)
         {
             bool mark_discontinuity = true;
 
+            bool has_enqueued = false;
+
             if(shared && shared->pat_valid)
-                response_enqueue_ts(client, shared->pat, mark_discontinuity);
+            {
+                has_enqueued |= response_enqueue_ts(client, shared->pat, mark_discontinuity);
+            }
 
             if(shared && shared->pmt_valid)
             {
-                response_enqueue_ts(client, shared->pmt, mark_discontinuity);
+                has_enqueued |= response_enqueue_ts(client, shared->pmt, mark_discontinuity);
                 mark_discontinuity = false;
             }
 
-            response_enqueue_ts(client, ts, mark_discontinuity);
+            const size_t burst_budget = response->burst_target ? response->burst_target
+                                                                : response->buffer_fill;
+
+            if(shared && shared->key_valid)
+            {
+                const size_t copy_limit = ts_align_down(burst_budget);
+                size_t copied = 0;
+                size_t offset = shared->key_start;
+
+                while(copied < copy_limit)
+                {
+                    uint8_t chunk[TS_PACKET_SIZE * 32];
+                    const size_t remaining = copy_limit - copied;
+                    const size_t request = (remaining < sizeof(chunk)) ? remaining : sizeof(chunk);
+                    const size_t chunk_size = shared_buffer_copy_from(shared, chunk, request, offset);
+
+                    if(chunk_size == 0)
+                        break;
+
+                    offset = (offset + chunk_size) % shared->size;
+                    copied += chunk_size;
+
+                    for(size_t i = 0; i + TS_PACKET_SIZE <= chunk_size; i += TS_PACKET_SIZE)
+                    {
+                        if(response_enqueue_ts(client, &chunk[i], mark_discontinuity))
+                        {
+                            has_enqueued = true;
+                        }
+                        else
+                        {
+                            break;
+                        }
+
+                        mark_discontinuity = false;
+                    }
+                }
+            }
+            else
+            {
+                has_enqueued |= response_enqueue_ts(client, ts, mark_discontinuity);
+            }
+
+            if(!has_enqueued)
+            {
+                has_enqueued |= response_enqueue_ts(client, ts, mark_discontinuity);
+            }
 
             response->waiting_for_keyframe = false;
 
